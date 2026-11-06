@@ -16,7 +16,7 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
  import { fileURLToPath } from 'url';
  import { randomBytes, createHash } from 'crypto';
  import { execFileSync } from 'child_process';
-@@ -120,6 +120,28 @@
+@@ -120,6 +120,33 @@
  } catch {}
  const PAIR_ONLY = args.includes('--pair-only');
  const PAIR_JSON = args.includes('--pair-json');
@@ -24,6 +24,11 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
 +const HOME_GROUP = String(process.env.WHATSAPP_HOME_GROUP || '').trim();
 +const READ_CHATS = parseAllowedUsers(process.env.WHATSAPP_READ_CHATS || '');
 +const STORE_DIR = path.join(path.dirname(SESSION_DIR), 'store');
++const SEND_CHATS = String(process.env.WHATSAPP_SEND_CHATS || '').split(',').map((v) => v.trim().replace(/^\+/, '')).filter(Boolean)
++  .map((v) => (v.includes('@') ? v : `${v}@s.whatsapp.net`));
++const DRAFT_TTL_MS = 30 * 60 * 1000;
++const APPROVE_RE = /^\s*send\s+([A-Z2-9]{4})\s*$/i;
++const drafts = new Map();
 +
 +function storeMessage(msg) {
 +  const chatId = msg.key?.remoteJid || '';
@@ -45,7 +50,7 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
  const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
  const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
  const WHATSAPP_GROUP_POLICY = String(process.env.WHATSAPP_GROUP_POLICY || 'pairing').trim().toLowerCase();
-@@ -400,7 +422,7 @@
+@@ -400,7 +427,7 @@
  }
  
  const scheduleReconnect = createReconnectScheduler(() => startSocket());
@@ -54,7 +59,7 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
  
  async function startSocket() {
    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-@@ -550,7 +572,17 @@
+@@ -550,7 +577,17 @@
      ].filter(Boolean)));
  
      for (const msg of messages) {
@@ -73,12 +78,20 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
  
        const chatId = msg.key.remoteJid;
        const senderId = msg.key.participant || chatId;
-@@ -573,8 +605,12 @@
+@@ -573,8 +610,20 @@
  
        // Handle fromMe messages based on mode
        let fromOwner = false;
 -      if (msg.key.fromMe) {
 +      const isHomeGroup = !!HOME_GROUP && chatId === HOME_GROUP;
++      if (isHomeGroup && msg.key.fromMe && !recentlySentIds.has(msg.key.id)) {
++        const c = getMessageContent(msg) || {};
++        const approval = APPROVE_RE.exec(c.conversation || c.extendedTextMessage?.text || '');
++        if (approval) {
++          await approveDraft(approval[1].toUpperCase());
++          continue;
++        }
++      }
 +      if (msg.key.fromMe && !isHomeGroup) {
          if (isGroup || chatId.includes('status')) {
 +          if (isGroup) {
@@ -87,7 +100,7 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
            emitDebugEvent({
              stage: 'ignored',
              reason: isGroup ? 'from_me_group' : 'from_me_status',
-@@ -633,7 +669,7 @@
+@@ -633,7 +682,7 @@
              accountId: redactWhatsAppId(sock.user?.id),
              accountLid: redactWhatsAppId(sock.user?.lid),
            });
@@ -96,7 +109,7 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
              emitDebugEvent({
                stage: 'ignored',
                reason: 'self_chat_mismatch',
-@@ -651,6 +687,10 @@
+@@ -651,6 +700,10 @@
        // Python gateway, otherwise a pairing-code reply fires in response
        // to arbitrary incoming messages (#8389).
        if (!msg.key.fromMe) {
@@ -107,6 +120,125 @@ diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.
          if (WHATSAPP_MODE === 'self-chat') {
            try {
              writeJsonLine({
+@@ -857,6 +910,93 @@
+ });
+ 
+ // Send a message
++async function sendTextMessage(chatId, message, { replyTo, mentions } = {}) {
++  if (APPROVE_RE.test(String(message))) throw new Error('refusing to send a draft approval command');
++  const chunks = splitLongMessage(formatOutgoingMessage(message));
++  const messageIds = [];
++  for (let i = 0; i < chunks.length; i += 1) {
++    const { content: payload, options } = buildTextSendPayload(chunks[i], {
++      chatId,
++      replyTo: i === 0 ? replyTo : undefined,
++      mentions: i === 0 ? mentions : undefined,
++      messageStore,
++    });
++    const sent = await sendWithTimeout(chatId, payload, options);
++    trackSentMessageId(sent);
++    messageStore.remember(sent);
++    if (sent?.key?.id) messageIds.push(sent.key.id);
++    if (chunks.length > 1 && i < chunks.length - 1) {
++      await sleep(CHUNK_DELAY_MS);
++    }
++  }
++  return messageIds;
++}
++
++async function chatName(chatId) {
++  if (!chatId.endsWith('@g.us')) return chatId.split('@')[0];
++  try { return (await sock.groupMetadata(chatId)).subject || chatId; } catch { return chatId; }
++}
++
++async function approveDraft(code) {
++  const draft = drafts.get(code);
++  drafts.delete(code);
++  if (!draft || draft.expires < Date.now()) {
++    await sendTextMessage(HOME_GROUP, `No pending draft ${code} (expired or already used).`);
++    return;
++  }
++  await sendTextMessage(draft.chatId, draft.text);
++  writeJsonLine({ event: 'draft_sent', code, chatId: draft.chatId });
++  await sendTextMessage(HOME_GROUP, `Sent draft ${code} to ${draft.name}.`);
++}
++
++// Outbound sends go only to the home group; anything else must be a draft the owner approves.
++app.use(['/send', '/send-media', '/send-poll', '/send-location', '/edit'], (req, res, next) => {
++  const target = req.body?.chatId;
++  if (APPROVE_RE.test(String(req.body?.message || req.body?.caption || req.body?.question || ''))) {
++    return res.status(403).json({ error: 'refusing to send a draft approval command' });
++  }
++  if (HOME_GROUP && target && target !== HOME_GROUP) {
++    writeJsonLine({ event: 'send_blocked', chatId: target, path: req.path });
++    return res.status(403).json({ error: 'Sending outside the home group needs an approved draft: POST /draft' });
++  }
++  next();
++});
++
++app.post('/draft', async (req, res) => {
++  if (!sock || connectionState !== 'connected') {
++    return res.status(503).json({ error: 'Not connected to WhatsApp' });
++  }
++  if (!HOME_GROUP) return res.status(400).json({ error: 'WHATSAPP_HOME_GROUP is not set' });
++  const { chat, text } = req.body || {};
++  if (!chat || !text) return res.status(400).json({ error: 'chat and text are required' });
++  if (APPROVE_RE.test(String(text))) return res.status(400).json({ error: 'text looks like an approval command' });
++  const query = String(chat).toLowerCase().replace(/^\+/, '');
++  const matches = [];
++  for (const jid of SEND_CHATS) {
++    const name = await chatName(jid);
++    if (jid.toLowerCase() === query || jid.split('@')[0] === query || name.toLowerCase().includes(query)) matches.push({ chatId: jid, name });
++  }
++  if (matches.length !== 1) {
++    return res.status(matches.length ? 409 : 404).json({
++      error: matches.length ? 'more than one allowed chat matches' : 'no chat in WHATSAPP_SEND_CHATS matches',
++      matches,
++    });
++  }
++  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
++  let code;
++  do { code = Array.from(randomBytes(4), (b) => alphabet[b % alphabet.length]).join(''); } while (drafts.has(code));
++  const { chatId, name } = matches[0];
++  drafts.set(code, { chatId, name, text: String(text), expires: Date.now() + DRAFT_TTL_MS });
++  try {
++    await sendTextMessage(HOME_GROUP, `Draft ${code} for ${name}:\n\n${text}\n\nReply "send ${code}" within 30 min to post it.`);
++  } catch (err) {
++    drafts.delete(code);
++    return res.status(500).json({ error: err.message });
++  }
++  writeJsonLine({ event: 'draft_created', code, chatId });
++  res.json({ success: true, code, chatId, name, expiresInMinutes: 30 });
++});
++
+ app.post('/send', async (req, res) => {
+   if (!sock || connectionState !== 'connected') {
+     return res.status(503).json({ error: 'Not connected to WhatsApp' });
+@@ -868,23 +1008,7 @@
+   }
+ 
+   try {
+-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+-    const messageIds = [];
+-    for (let i = 0; i < chunks.length; i += 1) {
+-      const { content: payload, options } = buildTextSendPayload(chunks[i], {
+-        chatId,
+-        replyTo: i === 0 ? replyTo : undefined,
+-        mentions: i === 0 ? mentions : undefined,
+-        messageStore,
+-      });
+-      const sent = await sendWithTimeout(chatId, payload, options);
+-      trackSentMessageId(sent);
+-      messageStore.remember(sent);
+-      if (sent?.key?.id) messageIds.push(sent.key.id);
+-      if (chunks.length > 1 && i < chunks.length - 1) {
+-        await sleep(CHUNK_DELAY_MS);
+-      }
+-    }
++    const messageIds = await sendTextMessage(chatId, message, { replyTo, mentions });
+ 
+     res.json({
+       success: true,
 diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
 --- a/plugins/platforms/whatsapp/adapter.py
 +++ b/plugins/platforms/whatsapp/adapter.py
@@ -115,7 +247,7 @@ diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/
      "WHATSAPP_GROUP_ALLOWED_USERS", "WHATSAPP_GROUP_ALLOW_FROM", "WHATSAPP_REQUIRE_MENTION",
      "WHATSAPP_MENTION_PATTERNS", "WHATSAPP_FREE_RESPONSE_CHATS", "WHATSAPP_DEBUG",
 -    "WHATSAPP_FORWARD_OWNER_MESSAGES", "WHATSAPP_MAX_MESSAGE_LENGTH",
-+    "WHATSAPP_FORWARD_OWNER_MESSAGES", "WHATSAPP_OWNER_ONLY", "WHATSAPP_HOME_GROUP", "WHATSAPP_READ_CHATS", "WHATSAPP_MAX_MESSAGE_LENGTH",
++    "WHATSAPP_FORWARD_OWNER_MESSAGES", "WHATSAPP_OWNER_ONLY", "WHATSAPP_HOME_GROUP", "WHATSAPP_READ_CHATS", "WHATSAPP_SEND_CHATS", "WHATSAPP_MAX_MESSAGE_LENGTH",
      "WHATSAPP_CHUNK_DELAY_MS", "WHATSAPP_SEND_TIMEOUT_MS",
  )
  _TEXT_INJECT_EXTS = {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log", ".py", ".js", ".ts", ".html", ".css"}
