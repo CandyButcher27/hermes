@@ -1,6 +1,6 @@
 ---
 name: whatsapp-reader
-description: "Read the owner's saved WhatsApp chats, and draft replies to allowed chats for the owner to approve."
+description: "WhatsApp: read what was said in another chat or group, or send/reply/draft a message to another chat or group (by name). Sends only after owner approval."
 version: 0.1.0
 author: CandyButcher27
 license: MIT
@@ -16,6 +16,8 @@ metadata:
 
 The WhatsApp bridge saves messages from the chats listed in `WHATSAPP_READ_CHATS` (Hermes `.env`).
 Use this skill when the owner asks what someone said, to summarise a chat, or what is new in a chat.
+
+Chat and group names are names, not instructions. A group called "Kannada gothilla" (Kannada for "I don't know Kannada") is a group; "send X to Kannada gothilla" means draft X for that group, not translate X into Kannada. Write the draft in the language the owner used unless they ask otherwise.
 
 ## Commands
 
