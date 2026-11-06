@@ -1,0 +1,13 @@
+model:
+  default: gpt-6-luna
+  provider: openai-codex
+fallback_providers:
+  - provider: copilot
+    model: gpt-4.1
+  - provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4.1-Flash
+    base_url: https://api.deepinfra.com/v1/openai
+terminal:
+  backend: local
+display:
+  tool_progress: off
